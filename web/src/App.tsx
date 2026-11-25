@@ -19,7 +19,6 @@ import {
   X,
 } from 'lucide-react'
 import { CameraViewport } from './components/CameraViewport'
-import { JoystickControl } from './components/JoystickControl'
 import { fetchHealth, getStoredToken, storeToken, telemetrySocketUrl, withTokenQuery } from './services/api'
 import { usePrahariApi } from './hooks/usePrahariApi'
 import type { Health, LogRow, Mode, Telemetry, Tuning } from './types/prahari'
@@ -69,6 +68,7 @@ export default function App() {
   const [tuneError, setTuneError] = useState('')
   const [logError, setLogError] = useState('')
   const [configLoaded, setConfigLoaded] = useState(false)
+  const [activeMotionKeys, setActiveMotionKeys] = useState<Set<string>>(() => new Set())
 
   const socket = useRef<WebSocket | null>(null)
   const simulatedInputBlockedRef = useRef(false)
@@ -77,6 +77,7 @@ export default function App() {
   const history = useRef<{ t: number; x: number; y: number }[]>([])
   const jogTimer = useRef<number | null>(null)
   const jogDirs = useRef({ pan: 0, tilt: 0 })
+  const pressedMotionKeys = useRef(new Set<string>())
   const deadmanTimer = useRef<number | null>(null)
   const deadmanRequested = useRef(false)
   const toastTimer = useRef<number | null>(null)
@@ -326,18 +327,7 @@ export default function App() {
     })
   }, [motionAllowed, api, notify])
 
-  const beginJog = useCallback(
-    (pan: number, tilt: number) => {
-      if (!motionAllowed) return
-      jogDirs.current = { pan, tilt }
-      sendJog()
-      if (jogTimer.current) window.clearInterval(jogTimer.current)
-      jogTimer.current = window.setInterval(sendJog, 100)
-    },
-    [motionAllowed, sendJog],
-  )
-
-  const stopJog = useCallback(() => {
+  const stopJogCommand = useCallback(() => {
     if (jogTimer.current) {
       window.clearInterval(jogTimer.current)
       jogTimer.current = null
@@ -346,9 +336,38 @@ export default function App() {
     jogDirs.current = { pan: 0, tilt: 0 }
     if (wasMoving) void api.jog(0, 0).catch(() => {})
   }, [api])
+  const stopJog = useCallback(() => {
+    pressedMotionKeys.current.clear()
+    setActiveMotionKeys(new Set())
+    stopJogCommand()
+  }, [stopJogCommand])
   stopJogRef.current = stopJog
 
   useEffect(() => {
+    if (!motionAllowed) stopJog()
+  }, [motionAllowed, stopJog])
+
+  useEffect(() => {
+    const movementKeys = new Set(['arrowleft', 'arrowright', 'arrowup', 'arrowdown', 'a', 'd', 'w', 's'])
+    const syncJog = () => {
+      if (!motionAllowed) {
+        stopJog()
+        return
+      }
+      const keys = pressedMotionKeys.current
+      setActiveMotionKeys(new Set(keys))
+      const pan = Number(keys.has('d') || keys.has('arrowright')) - Number(keys.has('a') || keys.has('arrowleft'))
+      const tilt = Number(keys.has('w') || keys.has('arrowup')) - Number(keys.has('s') || keys.has('arrowdown'))
+      if (pan === 0 && tilt === 0) {
+        stopJogCommand()
+        return
+      }
+      jogDirs.current = { pan, tilt }
+      if (!jogTimer.current) {
+        sendJog()
+        jogTimer.current = window.setInterval(sendJog, 100)
+      }
+    }
     const key = (e: KeyboardEvent) => {
       if (isTypingTarget(document.activeElement)) return
       if (e.code === 'Escape' || e.code === 'Space') {
@@ -356,25 +375,21 @@ export default function App() {
         if (!e.repeat) void estopAction()
         return
       }
-      const map: Record<string, [number, number]> = {
-        ArrowLeft: [-1, 0],
-        a: [-1, 0],
-        ArrowRight: [1, 0],
-        d: [1, 0],
-        ArrowUp: [0, 1],
-        w: [0, 1],
-        ArrowDown: [0, -1],
-        s: [0, -1],
-      }
-      const v = map[e.key] || map[e.key.toLowerCase()]
-      if (v) {
+      const keyName = e.key.toLowerCase()
+      if (movementKeys.has(keyName) && motionAllowed) {
         e.preventDefault()
-        if (!e.repeat) beginJog(v[0], v[1])
+        if (!e.repeat) {
+          pressedMotionKeys.current.add(keyName)
+          syncJog()
+        }
       }
     }
     const up = (e: KeyboardEvent) => {
-      const names = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'a', 'd', 'w', 's']
-      if (names.includes(e.key) || names.includes(e.key.toLowerCase())) stopJog()
+      const keyName = e.key.toLowerCase()
+      if (movementKeys.has(keyName)) {
+        pressedMotionKeys.current.delete(keyName)
+        syncJog()
+      }
     }
     window.addEventListener('keydown', key)
     window.addEventListener('keyup', up)
@@ -384,7 +399,7 @@ export default function App() {
       window.removeEventListener('keyup', up)
       window.removeEventListener('blur', stopJog)
     }
-  }, [beginJog, stopJog, estopAction])
+  }, [motionAllowed, sendJog, stopJog, stopJogCommand, estopAction])
 
   async function onSetMode(mode: Mode) {
     stopDeadman()
@@ -627,19 +642,37 @@ export default function App() {
                 </p>
               </div>
 
-              <div className="field">
-                <div className="field-label-row"><div className="field-label">Joystick control</div><div className="muted-small">DRAG / WASD / ARROWS</div></div>
-                <JoystickControl
-                  disabled={!motionAllowed}
-                  onMove={(pan, tilt) => {
-                    jogDirs.current = { pan, tilt }
-                    sendJog()
-                    if (jogTimer.current) window.clearInterval(jogTimer.current)
-                    jogTimer.current = window.setInterval(sendJog, 100)
-                  }}
-                  onEnd={stopJog}
-                />
-                <p className="help-text">Drag joystick to move pan/tilt. Release to stop. Keyboard jog still works; commands refresh every 100ms and backend jog safety timeout remains active.</p>
+              <div className={`field keyboard-control ${motionAllowed ? 'is-ready' : ''}`} aria-label="Keyboard pan and tilt control">
+                <div className="field-label-row">
+                  <div className="field-label">Keyboard control</div>
+                  <div className="muted-small">{motionAllowed ? 'HOLD TO MOVE' : 'LOCKED'}</div>
+                </div>
+                <div className="key-control-layout">
+                  <div className="key-control-cluster wasd-cluster" aria-label="WASD controls">
+                    <kbd className={`keycap ${activeMotionKeys.has('w') ? 'is-active' : ''}`}>W</kbd>
+                    <div className="keycap-row">
+                      <kbd className={`keycap ${activeMotionKeys.has('a') ? 'is-active' : ''}`}>A</kbd>
+                      <kbd className={`keycap ${activeMotionKeys.has('s') ? 'is-active' : ''}`}>S</kbd>
+                      <kbd className={`keycap ${activeMotionKeys.has('d') ? 'is-active' : ''}`}>D</kbd>
+                    </div>
+                  </div>
+                  <div className="key-control-divider" aria-hidden="true" />
+                  <div className="key-control-cluster arrow-cluster" aria-label="Arrow key controls">
+                    <kbd className={`keycap ${activeMotionKeys.has('arrowup') ? 'is-active' : ''}`}>↑</kbd>
+                    <div className="keycap-row">
+                      <kbd className={`keycap ${activeMotionKeys.has('arrowleft') ? 'is-active' : ''}`}>←</kbd>
+                      <kbd className={`keycap ${activeMotionKeys.has('arrowdown') ? 'is-active' : ''}`}>↓</kbd>
+                      <kbd className={`keycap ${activeMotionKeys.has('arrowright') ? 'is-active' : ''}`}>→</kbd>
+                    </div>
+                  </div>
+                  <div className="key-control-labels">
+                    <span><strong>W / ↑</strong> Tilt up</span>
+                    <span><strong>S / ↓</strong> Tilt down</span>
+                    <span><strong>A / ←</strong> Pan left</span>
+                    <span><strong>D / →</strong> Pan right</span>
+                  </div>
+                </div>
+                <p className="help-text">Hold a direction to move. Release to stop. Opposing directions cancel; movement is available only in calibrated MANUAL mode.</p>
               </div>
 
               <div className="field action-grid">
